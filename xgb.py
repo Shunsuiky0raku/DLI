@@ -34,3 +34,55 @@ USE_GPU = True
 TREE_METHOD = "gpu_hist" if USE_GPU else "hist"
 PREDICTOR = "gpu_predictor" if USE_GPU else "auto"
 
+# ==== Section 1: Load data from Drive ====
+from google.colab import drive
+drive.mount('/content/drive')
+
+CSV_PATH = "/content/drive/MyDrive/Individual Assignment/PhiUSIIL_Phishing_URL_Dataset.csv"
+
+# Read CSV safely (handles big files)
+df = pd.read_csv(CSV_PATH, low_memory=False)
+print("Shape:", df.shape)
+df.head(3)
+
+# ==== Section 2: Detect/normalize the label column ====
+possible_labels = [
+    'label','Label','LABEL','target','Target','class','Class','result','Result',
+    'status','Status','phishing','is_phishing','malicious','y','Y'
+]
+
+label_col = None
+for c in df.columns:
+    if c in possible_labels:
+        label_col = c
+        break
+
+# If still not found, try common binary columns by inspection
+if label_col is None:
+    # Heuristic: choose a column with exactly 2 unique values and not 'url'
+    candidates = [c for c in df.columns if c.lower() not in ['url','urls'] and df[c].nunique(dropna=True) in [2]]
+    label_col = candidates[0] if candidates else None
+
+if label_col is None:
+    raise ValueError("Could not auto-detect label column. Please rename your label column to 'label' and re-run.")
+
+print("Detected label column:", label_col)
+
+def normalize_labels(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.strip().str.lower()
+    mapping = {
+        '1':1,'true':1,'yes':1,'phish':1,'phishing':1,'malicious':1,'bad':1,'attack':1,'spam':1,
+        '0':0,'false':0,'no':0,'legit':0,'legitimate':0,'benign':0,'good':0
+    }
+    y = x.map(mapping)
+    if y.isna().any():
+        # numeric fallback
+        y_num = pd.to_numeric(x, errors='coerce')
+        if set(y_num.dropna().unique()).issubset({0,1}):
+            y = y.fillna(y_num)
+    # final fallback: keyword contains => 1 else 0
+    y = y.fillna(x.str.contains(r'phish|malic|attack|spam', regex=True)).astype(int)
+    return y
+
+y_all = normalize_labels(df[label_col])
+print("Class balance:\n", y_all.value_counts())
