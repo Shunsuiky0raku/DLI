@@ -34,3 +34,13 @@ USE_GPU = True
 TREE_METHOD = "gpu_hist" if USE_GPU else "hist"
 PREDICTOR = "gpu_predictor" if USE_GPU else "auto"
 
+# ==== Section 1: Load data from Drive ====
+from google.colab import drive
+drive.mount('/content/drive')
+
+CSV_PATH = "/content/drive/MyDrive/Individual Assignment/PhiUSIIL_Phishing_URL_Dataset.csv"
+
+# Read CSV safely (handles big files)
+df = pd.read_csv(CSV_PATH, low_memory=False)
+print("Shape:", df.shape)
+df.head(3)
