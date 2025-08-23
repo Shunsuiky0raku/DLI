@@ -44,3 +44,102 @@ CSV_PATH = "/content/drive/MyDrive/Individual Assignment/PhiUSIIL_Phishing_URL_D
 df = pd.read_csv(CSV_PATH, low_memory=False)
 print("Shape:", df.shape)
 df.head(3)
+
+# ==== Section 2: Detect/normalize the label column ====
+possible_labels = [
+    'label','Label','LABEL','target','Target','class','Class','result','Result',
+    'status','Status','phishing','is_phishing','malicious','y','Y'
+]
+
+label_col = None
+for c in df.columns:
+    if c in possible_labels:
+        label_col = c
+        break
+
+# If still not found, try common binary columns by inspection
+if label_col is None:
+    # Heuristic: choose a column with exactly 2 unique values and not 'url'
+    candidates = [c for c in df.columns if c.lower() not in ['url','urls'] and df[c].nunique(dropna=True) in [2]]
+    label_col = candidates[0] if candidates else None
+
+if label_col is None:
+    raise ValueError("Could not auto-detect label column. Please rename your label column to 'label' and re-run.")
+
+print("Detected label column:", label_col)
+
+def normalize_labels(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.strip().str.lower()
+    mapping = {
+        '1':1,'true':1,'yes':1,'phish':1,'phishing':1,'malicious':1,'bad':1,'attack':1,'spam':1,
+        '0':0,'false':0,'no':0,'legit':0,'legitimate':0,'benign':0,'good':0
+    }
+    y = x.map(mapping)
+    if y.isna().any():
+        # numeric fallback
+        y_num = pd.to_numeric(x, errors='coerce')
+        if set(y_num.dropna().unique()).issubset({0,1}):
+            y = y.fillna(y_num)
+    # final fallback: keyword contains => 1 else 0
+    y = y.fillna(x.str.contains(r'phish|malic|attack|spam', regex=True)).astype(int)
+    return y
+
+y_all = normalize_labels(df[label_col])
+print("Class balance:\n", y_all.value_counts())
+
+# ==== Section 3: Build the feature matrix X ====
+from urllib.parse import urlparse
+import tldextract
+import re
+
+def is_ip(host):
+    return bool(re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', str(host or '')))
+
+def url_lexical_features(u: str) -> dict:
+    u = str(u or "")
+    parsed = urlparse(u)
+    host = parsed.netloc or ""
+    path = parsed.path or ""
+    q = parsed.query or ""
+    ext = tldextract.extract(u)
+    subd_count = len([s for s in ext.subdomain.split('.') if s]) if ext.subdomain else 0
+    return {
+        "len_url": len(u),
+        "len_host": len(host),
+        "len_path": len(path),
+        "num_dots": u.count('.'),
+        "num_hyphens": u.count('-'),
+        "num_ats": u.count('@'),
+        "num_qmarks": u.count('?'),
+        "num_equals": u.count('='),
+        "num_slashes": u.count('/'),
+        "num_percents": u.count('%'),
+        "num_digits": sum(ch.isdigit() for ch in u),
+        "ratio_digits": (sum(ch.isdigit() for ch in u) / max(1, len(u))),
+        "has_https": int(u.lower().startswith("https")),
+        "is_ip_host": int(is_ip(host)),
+        "subdomain_count": subd_count,
+        "tld_len": len(ext.suffix or ""),
+    }
+
+# Decide feature strategy
+text_cols = [c for c in df.columns if df[c].dtype == 'object']
+has_url_only = (set([c.lower() for c in df.columns]) & {'url','urls'}) and (len(df.columns) <= 3)
+
+if has_url_only:
+    url_col = 'url' if 'url' in df.columns else 'URL' if 'URL' in df.columns else next(iter(set(df.columns) & set(['urls','Urls','URLS'])))
+    feats = df[url_col].astype(str).apply(url_lexical_features)
+    X = pd.DataFrame(list(feats))
+else:
+    # Use existing numeric features; drop label & obvious text columns
+    drop_cols = {label_col}
+    # keep url text if you want to add lexical features too; here we skip to keep it fast
+    non_numeric = set([c for c in df.columns if df[c].dtype == 'object'])
+    drop_cols |= non_numeric  # remove textual cols by default for XGBoost
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore').select_dtypes(include=[np.number])
+
+if X.shape[1] == 0:
+    raise RuntimeError("No numeric features found to train on. Please ensure your CSV has numeric features or a 'url' column.")
+
+print("X shape:", X.shape)
+X.head(3)
