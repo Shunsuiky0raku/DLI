@@ -200,3 +200,42 @@ f1s = 2*prec*rec/(prec+rec+1e-12)
 best_ix = int(np.nanargmax(f1s))
 best_thr = thr[max(0, best_ix-1)] if best_ix < len(thr) else 0.5  # guard
 print(f"Best F1 on val: {f1s[best_ix]:.4f} at threshold {best_thr:.4f}")
+# ==== Section 7: Evaluate on held-out test set ====
+test_proba = model.predict_proba(X_test)[:,1]
+y_pred = (test_proba >= best_thr).astype(int)
+
+acc = accuracy_score(y_test, y_pred)
+pre = precision_score(y_test, y_pred, zero_division=0)
+rec = recall_score(y_test, y_pred, zero_division=0)
+f1  = f1_score(y_test, y_pred, zero_division=0)
+roc = roc_auc_score(y_test, test_proba)
+
+# PR-AUC
+p, r, _ = precision_recall_curve(y_test, test_proba)
+pr_auc = auc(r, p)
+
+print(f"Test Accuracy : {acc:.4f}")
+print(f"Test Precision: {pre:.4f}")
+print(f"Test Recall   : {rec:.4f}")
+print(f"Test F1       : {f1:.4f}")
+print(f"ROC-AUC       : {roc:.4f}")
+print(f"PR-AUC        : {pr_auc:.4f}\n")
+
+print("Classification report:\n", classification_report(y_test, y_pred, digits=4))
+
+cm = confusion_matrix(y_test, y_pred)
+tn, fp, fn, tp = cm.ravel()
+print("Confusion Matrix [tn fp; fn tp]:")
+print(cm)
+
+# Curves (kept minimal & fast)
+plt.figure()
+fpr, tpr, _ = roc_curve(y_test, test_proba)
+plt.plot(fpr, tpr, label=f'ROC AUC={roc:.3f}')
+plt.plot([0,1],[0,1],'--')
+plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC Curve'); plt.legend(); plt.show()
+
+plt.figure()
+plt.plot(r, p, label=f'PR AUC={pr_auc:.3f}')
+plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('Precision-Recall'); plt.legend(); plt.show()
+
