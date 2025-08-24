@@ -144,3 +144,23 @@ if X.shape[1] == 0:
 
 print("X shape:", X.shape)
 X.head(3)
+
+# ==== Section 4: Split & impute ====
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_all, test_size=0.20, random_state=42, stratify=y_all
+)
+
+# Further carve out a small validation set from training for early stopping
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.15, random_state=42, stratify=y_train
+)
+
+imp = SimpleImputer(strategy="median")
+X_train = imp.fit_transform(X_train)
+X_val   = imp.transform(X_val)
+X_test  = imp.transform(X_test)
+
+pos = (y_train == 1).sum()
+neg = (y_train == 0).sum()
+scale_pos_weight = max(1.0, neg / max(1, pos))
+print(f"scale_pos_weight ~ {scale_pos_weight:.2f} (neg={neg}, pos={pos})")
