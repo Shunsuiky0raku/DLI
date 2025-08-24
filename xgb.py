@@ -88,10 +88,9 @@ def normalize_labels(s: pd.Series) -> pd.Series:
 y_all = normalize_labels(df[label_col])
 print("Class balance:\n", y_all.value_counts())
 
-# ==== Section 3: Build the feature matrix X ====
+# ==== PATCH to Section 3: Always build lexical features if URL present ====
 from urllib.parse import urlparse
-import tldextract
-import re
+import tldextract, re
 
 def is_ip(host):
     return bool(re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', str(host or '')))
@@ -101,7 +100,6 @@ def url_lexical_features(u: str) -> dict:
     parsed = urlparse(u)
     host = parsed.netloc or ""
     path = parsed.path or ""
-    q = parsed.query or ""
     ext = tldextract.extract(u)
     subd_count = len([s for s in ext.subdomain.split('.') if s]) if ext.subdomain else 0
     return {
@@ -123,27 +121,25 @@ def url_lexical_features(u: str) -> dict:
         "tld_len": len(ext.suffix or ""),
     }
 
-# Decide feature strategy
-text_cols = [c for c in df.columns if df[c].dtype == 'object']
-has_url_only = (set([c.lower() for c in df.columns]) & {'url','urls'}) and (len(df.columns) <= 3)
+# Detect URL column (if any)
+url_col = next((c for c in df.columns if c.strip().lower() in {"url","urls"}), None)
 
-if has_url_only:
-    url_col = 'url' if 'url' in df.columns else 'URL' if 'URL' in df.columns else next(iter(set(df.columns) & set(['urls','Urls','URLS'])))
-    feats = df[url_col].astype(str).apply(url_lexical_features)
-    X = pd.DataFrame(list(feats))
+# Numeric features from dataset (drop label + obvious text)
+drop_cols = {label_col}
+if url_col: drop_cols.add(url_col)
+non_numeric = set([c for c in df.columns if df[c].dtype == 'object'])
+drop_cols |= non_numeric
+X_num = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore').select_dtypes(include=[np.number])
+
+# Lexical features (if URL exists)
+if url_col:
+    X_lex = pd.DataFrame([url_lexical_features(u) for u in df[url_col].astype(str)])
 else:
-    # Use existing numeric features; drop label & obvious text columns
-    drop_cols = {label_col}
-    # keep url text if you want to add lexical features too; here we skip to keep it fast
-    non_numeric = set([c for c in df.columns if df[c].dtype == 'object'])
-    drop_cols |= non_numeric  # remove textual cols by default for XGBoost
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore').select_dtypes(include=[np.number])
+    X_lex = pd.DataFrame()  # no URL column
 
-if X.shape[1] == 0:
-    raise RuntimeError("No numeric features found to train on. Please ensure your CSV has numeric features or a 'url' column.")
-
-print("X shape:", X.shape)
-X.head(3)
+# Main model uses numeric features (as before)
+X = X_num.copy()
+print("X_num shape:", X_num.shape, "| X_lex shape:", X_lex.shape)
 
 # ==== Section 4: Split & impute ====
 X_train, X_test, y_train, y_test = train_test_split(
@@ -165,7 +161,7 @@ neg = (y_train == 0).sum()
 scale_pos_weight = max(1.0, neg / max(1, pos))
 print(f"scale_pos_weight ~ {scale_pos_weight:.2f} (neg={neg}, pos={pos})")
 
-# ==== Section 5: Train XGBoost (GPU) with early stopping ====
+# ==== Section 5A: Train XGBoost (GPU) with early stopping ====
 params = dict(
     tree_method=TREE_METHOD,
     predictor=PREDICTOR,
@@ -193,6 +189,50 @@ model.fit(
 )
 
 print("Best iteration:", model.get_booster().best_iteration)
+
+# ==== Section 5B: Train a small lexical-only XGBoost (for URL-only testing) ====
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from xgboost import XGBClassifier
+import joblib, json, os
+
+if url_col and not X_lex.empty:
+    Xl_train, Xl_test, yl_train, yl_test = train_test_split(
+        X_lex, y_all, test_size=0.20, random_state=42, stratify=y_all
+    )
+    Xl_train, Xl_val, yl_train, yl_val = train_test_split(
+        Xl_train, yl_train, test_size=0.15, random_state=42, stratify=yl_train
+    )
+    imp_lex = SimpleImputer(strategy="median")
+    Xl_train = imp_lex.fit_transform(Xl_train)
+    Xl_val   = imp_lex.transform(Xl_val)
+    Xl_test  = imp_lex.transform(Xl_test)
+
+    pos = (yl_train == 1).sum(); neg = (yl_train == 0).sum()
+    spw = max(1.0, neg / max(1, pos))
+
+    xgb_lex = XGBClassifier(
+        tree_method=TREE_METHOD, predictor=PREDICTOR,
+        n_estimators=800, max_depth=7, learning_rate=0.08,
+        subsample=0.9, colsample_bytree=0.8, min_child_weight=1,
+        reg_lambda=1.0, objective='binary:logistic', random_state=42,
+        n_jobs=-1, eval_metric='logloss', scale_pos_weight=spw
+    )
+    xgb_lex.fit(Xl_train, yl_train,
+                eval_set=[(Xl_val, yl_val)],
+                verbose=False, early_stopping_rounds=50)
+
+    # save artifacts
+    os.makedirs("/content/artifacts", exist_ok=True)
+    joblib.dump(xgb_lex, "/content/artifacts/xgb_phishing_lexical.pkl")
+    joblib.dump(imp_lex, "/content/artifacts/imputer_lexical.pkl")
+    with open("/content/artifacts/feature_names_lex.json","w") as f:
+        json.dump(list(X_lex.columns), f)
+
+    print("Lexical-only model saved.")
+else:
+    print("No URL column found or lexical features empty; skipping lexical-only model.")
+
 # ==== Section 6: Tune decision threshold for best F1 ====
 val_proba = model.predict_proba(X_val)[:,1]
 prec, rec, thr = precision_recall_curve(y_val, val_proba)
@@ -240,14 +280,34 @@ plt.plot(r, p, label=f'PR AUC={pr_auc:.3f}')
 plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('Precision-Recall'); plt.legend(); plt.show()
 
 # ==== Section 8: Persist model & helper ====
-import joblib, json, os
+import os, json, joblib, pandas as pd
+
 os.makedirs("/content/artifacts", exist_ok=True)
+
+# 1) Save the trained MAIN model + imputer
 joblib.dump(model, "/content/artifacts/xgb_phishing.pkl")
 joblib.dump(imp,   "/content/artifacts/imputer.pkl")
+
+# 2) Save the exact feature schema used during training (column order matters)
+if isinstance(X, pd.DataFrame):
+    feature_names = list(X.columns)
+else:
+    # If X isn't a DataFrame here, raise a clear error so we don't save junk
+    raise RuntimeError(
+        "Section 8: 'X' is not a DataFrame. "
+        "Please run this cell before converting X to arrays, or keep a copy of the original X."
+    )
+
 with open("/content/artifacts/feature_names.json","w") as f:
-    json.dump(list(X.shape[1] for _ in [None]) or [], f)  # placeholder to show pattern
+    json.dump(feature_names, f)
+
+# 3) (Recommended) Persist the tuned threshold for F1 so testing cells can reuse it
+if 'best_thr' in globals():
+    with open("/content/artifacts/threshold.json","w") as f:
+        json.dump({"best_thr": float(best_thr)}, f)
 
 print("Saved to /content/artifacts")
+print(os.listdir("/content/artifacts"))
 
 def predict_batch(df_like: pd.DataFrame, threshold: float = None):
     """
@@ -255,12 +315,167 @@ def predict_batch(df_like: pd.DataFrame, threshold: float = None):
     Returns predicted label (0/1) and probability.
     """
     if threshold is None:
-        threshold = float(best_thr)
+        # Reuse tuned threshold if available; else default to 0.5
+        threshold = float(best_thr) if 'best_thr' in globals() else 0.5
     Xt = imp.transform(df_like)
-    proba = model.predict_proba(Xt)[:,1]
+    proba = model.predict_proba(Xt)[:, 1]
     pred = (proba >= threshold).astype(int)
     return pred, proba
 
-# Example (commented)
-# pred, proba = predict_batch(pd.DataFrame(X_test[:5], columns=None))
-# print(pred, proba[:5])
+# # Example (commented)
+# sample = pd.DataFrame(X.head(5))   # uses the same feature columns
+# yhat, p = predict_batch(sample)
+# print(yhat, p[:5])
+
+# ==== Section 9 (revised): URL scoring utilities with full/lexical modes ====
+import re, json, os
+import numpy as np
+import pandas as pd
+from urllib.parse import urlparse
+import tldextract, joblib
+
+# Load best_thr (same as before)
+thr_path = "/content/artifacts/threshold.json"
+if os.path.exists(thr_path):
+    try:
+        with open(thr_path, "r") as f:
+            best_thr = float(json.load(f).get("best_thr", 0.5))
+    except Exception:
+        best_thr = 0.5
+else:
+    if 'best_thr' not in globals():
+        best_thr = 0.5
+
+# Load main artifacts if present
+model_path_main = "/content/artifacts/xgb_phishing.pkl"
+imp_path_main   = "/content/artifacts/imputer.pkl"
+feat_path_main  = "/content/artifacts/feature_names.json"
+
+model_main = joblib.load(model_path_main) if os.path.exists(model_path_main) else None
+imp_main   = joblib.load(imp_path_main)   if os.path.exists(imp_path_main)   else None
+feature_names_main = None
+if os.path.exists(feat_path_main):
+    with open(feat_path_main,"r") as f: feature_names_main = json.load(f)
+
+# Load lexical artifacts (for URL-only scoring)
+model_path_lex = "/content/artifacts/xgb_phishing_lexical.pkl"
+imp_path_lex   = "/content/artifacts/imputer_lexical.pkl"
+feat_path_lex  = "/content/artifacts/feature_names_lex.json"
+
+model_lex = joblib.load(model_path_lex) if os.path.exists(model_path_lex) else None
+imp_lex   = joblib.load(imp_path_lex)   if os.path.exists(imp_path_lex)   else None
+feature_names_lex = None
+if os.path.exists(feat_path_lex):
+    with open(feat_path_lex,"r") as f: feature_names_lex = json.load(f)
+
+def is_ip(host):
+    return bool(re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', str(host or '')))
+
+def url_lexical_features(u: str) -> dict:
+    u = str(u or "")
+    parsed = urlparse(u)
+    host = parsed.netloc or ""
+    path = parsed.path or ""
+    ext = tldextract.extract(u)
+    subd_count = len([s for s in ext.subdomain.split('.') if s]) if ext.subdomain else 0
+    return {
+        "len_url": len(u),
+        "len_host": len(host),
+        "len_path": len(path),
+        "num_dots": u.count('.'),
+        "num_hyphens": u.count('-'),
+        "num_ats": u.count('@'),
+        "num_qmarks": u.count('?'),
+        "num_equals": u.count('='),
+        "num_slashes": u.count('/'),
+        "num_percents": u.count('%'),
+        "num_digits": sum(ch.isdigit() for ch in u),
+        "ratio_digits": (sum(ch.isdigit() for ch in u) / max(1, len(u))),
+        "has_https": int(u.lower().startswith("https")),
+        "is_ip_host": int(is_ip(host)),
+        "subdomain_count": subd_count,
+        "tld_len": len(ext.suffix or ""),
+    }
+
+def make_feature_df_from_urls(urls, feature_names):
+    lex = pd.DataFrame([url_lexical_features(u) for u in urls])
+    # IMPORTANT: initialize with NaN so SimpleImputer fills medians
+    X_df_full = pd.DataFrame(np.nan, index=lex.index, columns=feature_names)
+    for c in lex.columns:
+        if c in X_df_full.columns:
+            X_df_full[c] = lex[c]
+    return X_df_full[feature_names]
+
+def score_urls(urls, threshold: float = None, mode: str = "lexical", return_df: bool = False):
+    """
+    mode="lexical": use the lexical-only model (URL-only testing)
+    mode="full":    attempt to use the main model (requires full feature row)
+    """
+    if threshold is None:
+        threshold = float(best_thr)
+
+    if mode == "lexical":
+        if not (model_lex and imp_lex and feature_names_lex):
+            raise RuntimeError("Lexical model artifacts not found. Re-run Section 5B.")
+        X_df = make_feature_df_from_urls(urls, feature_names_lex)
+        Xt = imp_lex.transform(X_df)
+        proba = model_lex.predict_proba(Xt)[:,1]
+    else:
+        if not (model_main and imp_main and feature_names_main):
+            raise RuntimeError("Main model artifacts not found.")
+        # WARNING: Without the full numeric feature vector, this will be weak.
+        X_df = make_feature_df_from_urls(urls, feature_names_main)
+        Xt = imp_main.transform(X_df)
+        proba = model_main.predict_proba(Xt)[:,1]
+
+    pred = (proba >= threshold).astype(int)
+    out = pd.DataFrame({
+        "url": urls,
+        "phish_probability": proba,
+        "prediction": np.where(pred==1, "PHISHING", "LEGIT")
+    }).sort_values("phish_probability", ascending=False).reset_index(drop=True)
+    if return_df:
+        return out
+    else:
+        from IPython.display import display
+        display(out)
+
+# ==== Section 10A (unchanged UI, but now defaults to lexical mode) ====
+user_url = input("Enter a URL to test: ").strip()
+if not user_url:
+    print("No URL entered.")
+else:
+    res = score_urls([user_url], mode="lexical", return_df=True)
+    row = res.iloc[0]
+    print(f"\nURL: {row['url']}")
+    print(f"Prediction: {row['prediction']}  "
+          f"(prob={row['phish_probability']:.4f}, threshold={float(best_thr):.3f})")
+
+# ==== Section 10B: Interactive Threshold widget tester ====
+# Enter a URL, adjust threshold, and click "Score URL"
+!pip -q install ipywidgets
+import ipywidgets as widgets
+from IPython.display import display
+
+url_box = widgets.Text(
+    value="https://example.com",
+    placeholder="Paste a URL…",
+    description="URL:",
+    layout=widgets.Layout(width="80%")
+)
+thr_slider = widgets.FloatSlider(value=float(best_thr), min=0.0, max=1.0, step=0.01, description="Threshold")
+out = widgets.Output()
+
+def on_click(_):
+    out.clear_output()
+    urls = [url_box.value.strip()] if url_box.value.strip() else []
+    if not urls:
+        with out: print("Please enter a URL.")
+        return
+    df = score_urls(urls, threshold=float(thr_slider.value), return_df=True)
+    with out: display(df)
+
+button = widgets.Button(description="Score URL", button_style="primary")
+button.on_click(on_click)
+
+display(url_box, thr_slider, button, out)
