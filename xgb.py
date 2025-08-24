@@ -193,3 +193,10 @@ model.fit(
 )
 
 print("Best iteration:", model.get_booster().best_iteration)
+# ==== Section 6: Tune decision threshold for best F1 ====
+val_proba = model.predict_proba(X_val)[:,1]
+prec, rec, thr = precision_recall_curve(y_val, val_proba)
+f1s = 2*prec*rec/(prec+rec+1e-12)
+best_ix = int(np.nanargmax(f1s))
+best_thr = thr[max(0, best_ix-1)] if best_ix < len(thr) else 0.5  # guard
+print(f"Best F1 on val: {f1s[best_ix]:.4f} at threshold {best_thr:.4f}")
