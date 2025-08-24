@@ -164,3 +164,32 @@ pos = (y_train == 1).sum()
 neg = (y_train == 0).sum()
 scale_pos_weight = max(1.0, neg / max(1, pos))
 print(f"scale_pos_weight ~ {scale_pos_weight:.2f} (neg={neg}, pos={pos})")
+
+# ==== Section 5: Train XGBoost (GPU) with early stopping ====
+params = dict(
+    tree_method=TREE_METHOD,
+    predictor=PREDICTOR,
+    n_estimators=2000,            # with early stopping; will stop much earlier
+    max_depth=8,
+    learning_rate=0.07,
+    subsample=0.9,
+    colsample_bytree=0.8,
+    min_child_weight=1,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
+    objective='binary:logistic',
+    random_state=42,
+    n_jobs=-1,
+    eval_metric='logloss',
+    scale_pos_weight=scale_pos_weight
+)
+
+model = XGBClassifier(**params)
+model.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    verbose=False,
+    early_stopping_rounds=75
+)
+
+print("Best iteration:", model.get_booster().best_iteration)
