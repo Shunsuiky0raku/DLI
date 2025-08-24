@@ -239,3 +239,28 @@ plt.figure()
 plt.plot(r, p, label=f'PR AUC={pr_auc:.3f}')
 plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('Precision-Recall'); plt.legend(); plt.show()
 
+# ==== Section 8: Persist model & helper ====
+import joblib, json, os
+os.makedirs("/content/artifacts", exist_ok=True)
+joblib.dump(model, "/content/artifacts/xgb_phishing.pkl")
+joblib.dump(imp,   "/content/artifacts/imputer.pkl")
+with open("/content/artifacts/feature_names.json","w") as f:
+    json.dump(list(X.shape[1] for _ in [None]) or [], f)  # placeholder to show pattern
+
+print("Saved to /content/artifacts")
+
+def predict_batch(df_like: pd.DataFrame, threshold: float = None):
+    """
+    Pass a DataFrame with the same numeric feature columns used in training.
+    Returns predicted label (0/1) and probability.
+    """
+    if threshold is None:
+        threshold = float(best_thr)
+    Xt = imp.transform(df_like)
+    proba = model.predict_proba(Xt)[:,1]
+    pred = (proba >= threshold).astype(int)
+    return pred, proba
+
+# Example (commented)
+# pred, proba = predict_batch(pd.DataFrame(X_test[:5], columns=None))
+# print(pred, proba[:5])
