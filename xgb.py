@@ -87,10 +87,9 @@ def normalize_labels(s: pd.Series) -> pd.Series:
 y_all = normalize_labels(df[label_col])
 print("Class balance:\n", y_all.value_counts())
 
-# ==== Section 3: Build the feature matrix X ====
+# ==== PATCH to Section 3: Always build lexical features if URL present ====
 from urllib.parse import urlparse
-import tldextract
-import re
+import tldextract, re
 
 def is_ip(host):
     return bool(re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', str(host or '')))
@@ -100,7 +99,6 @@ def url_lexical_features(u: str) -> dict:
     parsed = urlparse(u)
     host = parsed.netloc or ""
     path = parsed.path or ""
-    q = parsed.query or ""
     ext = tldextract.extract(u)
     subd_count = len([s for s in ext.subdomain.split('.') if s]) if ext.subdomain else 0
     return {
@@ -122,24 +120,22 @@ def url_lexical_features(u: str) -> dict:
         "tld_len": len(ext.suffix or ""),
     }
 
-# Decide feature strategy
-text_cols = [c for c in df.columns if df[c].dtype == 'object']
-has_url_only = (set([c.lower() for c in df.columns]) & {'url','urls'}) and (len(df.columns) <= 3)
+# Detect URL column (if any)
+url_col = next((c for c in df.columns if c.strip().lower() in {"url","urls"}), None)
 
-if has_url_only:
-    url_col = 'url' if 'url' in df.columns else 'URL' if 'URL' in df.columns else next(iter(set(df.columns) & set(['urls','Urls','URLS'])))
-    feats = df[url_col].astype(str).apply(url_lexical_features)
-    X = pd.DataFrame(list(feats))
+# Numeric features from dataset (drop label + obvious text)
+drop_cols = {label_col}
+if url_col: drop_cols.add(url_col)
+non_numeric = set([c for c in df.columns if df[c].dtype == 'object'])
+drop_cols |= non_numeric
+X_num = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore').select_dtypes(include=[np.number])
+
+# Lexical features (if URL exists)
+if url_col:
+    X_lex = pd.DataFrame([url_lexical_features(u) for u in df[url_col].astype(str)])
 else:
-    # Use existing numeric features; drop label & obvious text columns
-    drop_cols = {label_col}
-    # keep url text if you want to add lexical features too; here we skip to keep it fast
-    non_numeric = set([c for c in df.columns if df[c].dtype == 'object'])
-    drop_cols |= non_numeric  # remove textual cols by default for XGBoost
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore').select_dtypes(include=[np.number])
+    X_lex = pd.DataFrame()  # no URL column
 
-if X.shape[1] == 0:
-    raise RuntimeError("No numeric features found to train on. Please ensure your CSV has numeric features or a 'url' column.")
-
-print("X shape:", X.shape)
-X.head(3)
+# Main model uses numeric features (as before)
+X = X_num.copy()
+print("X_num shape:", X_num.shape, "| X_lex shape:", X_lex.shape)
